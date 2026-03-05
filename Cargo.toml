@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "module-01-intro",
+    "module-02-routing",
+    "module-03-extractors",
+    "module-04-responses",
+    "module-05-state",
+    "module-06-middleware",
+    "module-07-errors",
+    "module-08-database",
+    "module-09-auth",
+    "module-10-advanced",
+    "module-11-testing",
+    "module-12-production",
+]
+
+# Shared dependencies across all modules
+[workspace.dependencies]
+# Core Axum Framework
+axum = "0.8.8"
+axum-extra = { version = "0.12.5", features = ["typed-header", "query", "multipart"] }
+
+# Async Runtime
+tokio = { version = "1.50.0", features = ["full"] }

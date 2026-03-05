@@ -1,0 +1,8 @@
+[package]
+name = "module-01-intro"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = {workspace = true}
+tokio = {workspace = true}

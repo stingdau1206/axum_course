@@ -1,0 +1,6 @@
+[package]
+name = "module-06-middleware"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
