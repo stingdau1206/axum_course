@@ -287,14 +287,29 @@ dependencies = [
 [[package]]
 name = "module-03-extractors"
 version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde",
+ "tokio",
+]
 
 [[package]]
 name = "module-04-responses"
 version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde",
+ "tokio",
+]
 
 [[package]]
 name = "module-05-state"
 version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde",
+ "tokio",
+]
 
 [[package]]
 name = "module-06-middleware"
