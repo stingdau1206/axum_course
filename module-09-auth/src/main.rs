@@ -1,240 +1,205 @@
+use std::env;
+
+use argon2::{Argon2, password_hash::SaltString};
 use axum::{
-    extract::{Path, Request, State},
+    Extension, Json, Router,
+    extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool};
-use std::sync::Arc;
-use uuid::Uuid;
 use dotenvy::dotenv;
-
-// ============================================================================
-// MODELS & CONFIG
-// ============================================================================
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 
 #[derive(Clone)]
-struct AuthConfig {
-    jwt_secret: String,
+struct CurrentUser {
+    user_id: uuid::Uuid,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, thiserror::Error)]
+enum DbError {
+    #[error("User not found")]
+    NotFound,
+    #[error("Database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+}
+
+impl IntoResponse for DbError {
+    fn into_response(self) -> Response {
+        let(status, msg) = match self {
+            DbError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
+            DbError::Sqlx(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+        };
+
+        (status, msg).into_response()
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 struct Claims {
-    sub: String, // user_id
+    sub: String,
     exp: usize,
-    role: String,
 }
 
-#[derive(sqlx::FromRow, Serialize, Deserialize, Clone)]
-struct User {
-    id: Uuid,
-    username: String,
-    password: String, // Đây là chuỗi đã băm
-    is_lock: bool,
+#[derive(Clone)]
+struct AppState {
+    secret_key: String,
+    db: PgPool,
 }
-
 #[derive(Deserialize)]
-struct LoginRequest {
+struct LoginPayload {
     username: String,
     password: String,
 }
 
 #[derive(Serialize)]
-struct LoginResponse {
+struct AuthResponse {
     token: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CurrentUser {
-    id: String,
-    role: String,
+#[derive(sqlx::FromRow)]
+struct User {
+    id: uuid::Uuid,
+    username: String,
+    password: String,
 }
 
-// ============================================================================
-// ERROR HANDLING
-// ============================================================================
-
-#[derive(Debug, thiserror::Error)]
-enum AppError {
-    #[error("Database error")]
-    Sqlx(#[from] sqlx::Error),
-    #[error("User not found or wrong password")]
-    Unauthorized,
-    #[error("Internal error")]
-    Internal,
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let (status, msg) = match self {
-            AppError::Sqlx(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Invalid credentials"),
-            AppError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
-        };
-        (status, msg).into_response()
-    }
-}
-
-// ============================================================================
-// AUTH UTILS (Băm & JWT)
-// ============================================================================
-
-fn hash_password(password: &str) -> String {
-    use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
-    let salt = SaltString::generate(&mut rand::thread_rng());
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-fn verify_password(password: &str, hash: &str) -> bool {
-    use argon2::{Argon2, PasswordHash, PasswordVerifier};
-    let parsed_hash = PasswordHash::new(hash).unwrap();
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed_hash)
-        .is_ok()
-}
-
-fn create_token(config: &AuthConfig, user_id: &str) -> Result<String, AppError> {
-    let expiry = Utc::now() + Duration::hours(24);
-    let claims = Claims {
-        sub: user_id.to_string(),
-        exp: expiry.timestamp() as usize,
-        role: "user".to_string(),
-    };
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+async fn register_handler(State(state): State<AppState>, Json(body): Json<LoginPayload>) -> Result<StatusCode, DbError> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    
+    sqlx::query(
+        "INSERT INTO users (id, username, password) VALUES ($1, $2, $3)"
     )
-    .map_err(|_| AppError::Internal)
-}
+    .bind(uuid::Uuid::new_v4())
+    .bind(body.username)
+    .bind(body.password)
+    .execute(&state.db)
+    .await?;
 
-// ============================================================================
-// HANDLERS
-// ============================================================================
-
-async fn register(State(pool): State<PgPool>, Json(payload): Json<LoginRequest>) -> Result<StatusCode, AppError> {
-    let hashed = hash_password(&payload.password);
-    sqlx::query("INSERT INTO users (id, username, password, is_lock) VALUES ($1, $2, $3, $4)")
-        .bind(Uuid::new_v4())
-        .bind(&payload.username)
-        .bind(&hashed)
-        .bind(false)
-        .execute(&pool)
-        .await?;
     Ok(StatusCode::CREATED)
 }
 
-async fn login(
-    State(pool): State<PgPool>,
-    State(config): State<Arc<AuthConfig>>,
-    Json(payload): Json<LoginRequest>,
-) -> Result<Json<LoginResponse>, AppError> {
-    // 1. Tìm user
+async fn login_handler(
+    State(state): State<AppState>,
+    Json(body): Json<LoginPayload>,
+) -> Result<Json<AuthResponse>, StatusCode> {
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = $1")
-        .bind(&payload.username)
-        .fetch_optional(&pool)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
+        .bind(&body.username)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // 2. Verify pass
-    if !verify_password(&payload.password, &user.password) {
-        return Err(AppError::Unauthorized);
+    if user.password != body.password {
+        return Err(StatusCode::UNAUTHORIZED);
     }
+    let exp = Utc::now()
+        .checked_add_signed(Duration::hours(1))
+        .expect("valid timestamp")
+        .timestamp() as usize;
 
-    // 3. Tạo Token
-    let token = create_token(&config, &user.id.to_string())?;
-    Ok(Json(LoginResponse { token }))
-}
-
-// Route được bảo vệ
-async fn get_me(axum::Extension(user): axum::Extension<CurrentUser>) -> Json<CurrentUser> {
-    Json(user)
-}
-
-// ============================================================================
-// AUTH MIDDLEWARE
-// ============================================================================
-
-async fn auth_middleware(
-    State(config): State<Arc<AuthConfig>>,
-    mut request: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let auth_header = request
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    let token = auth_header.ok_or(StatusCode::UNAUTHORIZED)?;
-    
-    let token_data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(config.jwt_secret.as_bytes()),
-        &Validation::default(),
-    )
-    .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    let current_user = CurrentUser {
-        id: token_data.claims.sub,
-        role: token_data.claims.role,
+    let claims = Claims {
+        sub: user.id.to_string(),
+        exp,
     };
 
-    request.extensions_mut().insert(current_user); // Bơm thông tin user vào request
-    Ok(next.run(request).await)
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(state.secret_key.as_ref()),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(AuthResponse { token }))
 }
 
-// ============================================================================
-// MAIN
-// ============================================================================
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let auth_header = req
+        .headers()
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+
+    let token_data = match auth_header {
+        Some(token) => {
+            let secret = state.secret_key;
+            decode::<Claims>(
+                token,
+                &DecodingKey::from_secret(secret.as_ref()),
+                &Validation::new(Algorithm::HS256),
+            )
+            .map_err(|_| StatusCode::UNAUTHORIZED)?
+        }
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
+
+    let user_uuid =
+        uuid::Uuid::parse_str(&token_data.claims.sub).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    req.extensions_mut()
+        .insert(CurrentUser { user_id: user_uuid });
+    Ok(next.run(req).await)
+}
+
+async fn secret_dashboard(Extension(user): Extension<CurrentUser>) -> String {
+    format!(
+        "Chào sếp có ID là: {}. Đây là dữ liệu tối mật!",
+        user.user_id
+    )
+}
 
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+    let secret_key = env::var("JWT_SECRET").expect("JWT_SECRET must be set in .env");
+    let database_url = env::var("DATABASE_URL").expect("JWT_SECRET must be set in .env");
+
+    let pool = PgPool::connect(&database_url)
         .await
-        .expect("Can't connect to DB");
+        .expect("cant connect to database");
 
-    // Khởi tạo bảng
-    sqlx::query("
-        CREATE TABLE IF NOT EXISTS users (
-            id UUID PRIMARY KEY,
-            username TEXT NOT NULL UNIQUE,
-            password TEXT NOT NULL,
-            is_lock BOOLEAN DEFAULT FALSE
-        )
-    ").execute(&pool).await.unwrap();
+    sqlx::query(
+        "
+        CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        password TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("can't create table users");
 
-    let auth_config = Arc::new(AuthConfig {
-        jwt_secret: "rat-la-bi-mat".to_string(),
-    });
+    let state = AppState {
+        secret_key: secret_key,
+        db: pool,
+    };
 
-    // Gom nhóm các route cần bảo vệ
-    let protected_routes = Router::new()
-        .route("/me", get(get_me))
-        .layer(middleware::from_fn_with_state(auth_config.clone(), auth_middleware));
+    let admin_routes = Router::new()
+        .route("/dashboard", get(secret_dashboard))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     let app = Router::new()
-        .route("/register", post(register))
-        .route("/login", post(login))
-        .nest("/api", protected_routes) // Các route bắt đầu bằng /api/me sẽ bị chặn
-        .with_state(pool)
-        .with_state(auth_config);
+        .route("/register", post(register_handler))
+        .route("/login", post(login_handler))
+        .nest("/admin", admin_routes)
+        .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("🚀 Server running on http://localhost:3000");
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .expect("Failed to bind port 3000");
+    axum::serve(listener, app)
+        .await
+        .expect("Failed to start server");
 }
