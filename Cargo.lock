@@ -1113,6 +1113,14 @@ dependencies = [
 [[package]]
 name = "module-11-testing"
 version = "0.1.0"
+dependencies = [
+ "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
 
 [[package]]
 name = "module-12-production"
